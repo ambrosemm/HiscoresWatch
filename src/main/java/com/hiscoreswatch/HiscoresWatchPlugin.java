@@ -3,6 +3,7 @@ package com.hiscoreswatch;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.inject.Provides;
+import java.awt.Color;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import javax.inject.Inject;
@@ -17,6 +18,9 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+// JagexColors import is now removed as it's unused
+// This is the correct import path for the ChatMessageBuilder utility
+import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -33,7 +37,8 @@ import okhttp3.ResponseBody;
 public class HiscoresWatchPlugin extends Plugin
 {
 	private static final String HISCORES_API_URL = "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=";
-
+	// Use a long literal (L) for a long constant
+	private static final long MAX_XP = 200_000_000L;
 	private Cache<String, Boolean> checkedPlayers;
 
 	@Inject
@@ -126,7 +131,6 @@ public class HiscoresWatchPlugin extends Plugin
 			@Override
 			public void onResponse(Call call, Response response)
 			{
-				// Use a try-with-resources block to ensure the response is always closed
 				try (ResponseBody responseBody = response.body())
 				{
 					if (!response.isSuccessful())
@@ -143,17 +147,15 @@ public class HiscoresWatchPlugin extends Plugin
 					final String body = responseBody.string();
 					final String[] stats = body.split("\n");
 					final int rankThreshold = config.rankThreshold();
+					// Use the new config setting instead of a hardcoded value
+					final boolean alertFor200m = config.alertFor200mXp();
 
-					// --- CORE LOGIC CHANGE ---
-					// Loop through every hiscore category instead of just one.
 					for (Hiscores hiscore : Hiscores.values())
 					{
 						int apiIndex = hiscore.getApiIndex();
 
-						// Ensure the response is long enough for the current category
 						if (stats.length <= apiIndex)
 						{
-							// All subsequent categories will also be out of bounds, so we can stop.
 							log.warn("Hiscores response for {} was too short. Stopping check at {}.", playerName, hiscore.getName());
 							break;
 						}
@@ -161,7 +163,6 @@ public class HiscoresWatchPlugin extends Plugin
 						String hiscoreData = stats[apiIndex];
 						if (hiscoreData.isEmpty() || !hiscoreData.contains(","))
 						{
-							// Skip malformed lines
 							continue;
 						}
 
@@ -171,21 +172,22 @@ public class HiscoresWatchPlugin extends Plugin
 							int rank = Integer.parseInt(hiscoreStats[0]);
 							int score = Integer.parseInt(hiscoreStats[1]);
 
-							// Check if the player is ranked and meets the threshold
+							// Rank Check
 							if (rank > 0 && score > 0 && rank <= rankThreshold)
 							{
-								log.info("High-ranking player found! {} is rank {} in {}", playerName, rank, hiscore.getName());
+								sendRankAlert(playerName, rank, hiscore);
+							}
 
-								// Final variables for use in the lambda
-								final int finalRank = rank;
-								final Hiscores finalHiscore = hiscore;
-
-								clientThread.invoke(() -> {
-									String message = String.format("%s is nearby and is rank %d in %s!",
-											playerName, finalRank, finalHiscore.getName());
-									client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, null);
-									notifier.notify(message);
-								});
+							// --- 200M XP CHECK (LOGIC UPDATED HERE) ---
+							boolean isSkill = hiscore.getApiIndex() <= Hiscores.CONSTRUCTION.getApiIndex();
+							// Add a check to specifically exclude the "Overall" category
+							if (alertFor200m && isSkill && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
+							{
+								long xp = Long.parseLong(hiscoreStats[2]);
+								if (xp >= MAX_XP)
+								{
+									send200mXpAlert(playerName, hiscore);
+								}
 							}
 						}
 						catch (NumberFormatException | ArrayIndexOutOfBoundsException e)
@@ -199,6 +201,44 @@ public class HiscoresWatchPlugin extends Plugin
 					log.error("Failed to process hiscores response for player {}: {}", playerName, e.getMessage());
 				}
 			}
+		});
+	}
+
+	private void sendRankAlert(String playerName, int rank, Hiscores hiscore)
+	{
+		clientThread.invoke(() -> {
+			String notificationMessage = String.format("%s is nearby and is rank %d in %s!",
+					playerName, rank, hiscore.getName());
+			notifier.notify(notificationMessage);
+
+			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder()
+					.append(Color.GREEN, playerName)
+					.append(Color.GREEN, " is nearby and is rank ")
+					.append(Color.GREEN, String.valueOf(rank))
+					.append(Color.GREEN, " in ")
+					.append(Color.GREEN, hiscore.getName())
+					.append(Color.GREEN, "!");
+
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessageBuilder.build(), null);
+		});
+	}
+
+	private void send200mXpAlert(String playerName, Hiscores hiscore)
+	{
+		clientThread.invoke(() -> {
+			String notificationMessage = String.format("%s is nearby with 200m XP in %s!",
+					playerName, hiscore.getName());
+			notifier.notify(notificationMessage);
+
+			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder()
+					.append(Color.GREEN, playerName)
+					.append(Color.GREEN, " is nearby with ")
+					.append(Color.GREEN, "200m XP")
+					.append(Color.GREEN, " in ")
+					.append(Color.GREEN, hiscore.getName())
+					.append(Color.GREEN, "!");
+
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessageBuilder.build(), null);
 		});
 	}
 }

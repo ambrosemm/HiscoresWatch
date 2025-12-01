@@ -20,6 +20,18 @@ public interface HiscoresWatchConfig extends Config
 	)
 	default int rankThreshold()
 	{
-		return 25; // Default to front page ranks
+		return 25;
+	}
+
+	// --- ADD THIS CONFIGURATION ITEM ---
+	@ConfigItem(
+			keyName = "alertFor200mXp",
+			name = "Alert for 200m XP",
+			description = "Notifies you when a player with 200m XP in a skill is nearby.",
+			position = 2
+	)
+	default boolean alertFor200mXp()
+	{
+		return true; // Enabled by default
 	}
 }
