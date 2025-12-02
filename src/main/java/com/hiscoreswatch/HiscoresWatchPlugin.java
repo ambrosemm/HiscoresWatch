@@ -8,13 +8,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,9 +27,12 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
 import net.runelite.api.Player;
+import net.runelite.api.clan.ClanChannel;
 import net.runelite.api.events.ClanChannelChanged;
 import net.runelite.api.events.FriendsChatMemberJoined;
+import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.events.PlayerSpawned;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
@@ -39,6 +42,7 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.ColorUtil;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -56,6 +60,16 @@ import okhttp3.ResponseBody;
 )
 public class HiscoresWatchPlugin extends Plugin
 {
+	// --- Constants ---
+	private static final String HISCORES_API_URL = "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=";
+	private static final long MAX_XP = 200_000_000L;
+	private static final int API_REQUEST_DELAY_MS = 500;
+	private static final int MAX_LISTED_ACHIEVEMENTS = 5;
+
+	// Constants for configuration management
+	private static final String CONFIG_GROUP = "hiscoreswatch";
+	private static final String IGNORE_LIST_KEY = "ignoreList";
+
 	/**
 	 * An enum representing the source of a player detection event.
 	 */
@@ -63,11 +77,12 @@ public class HiscoresWatchPlugin extends Plugin
 	@RequiredArgsConstructor
 	private enum DetectionSource
 	{
-		NEARBY("is nearby and is notable for: "),
-		FRIENDS_CHAT("joined your friends chat and is notable for: "),
-		CLAN_CHAT("joined your clan and is notable for: ");
+		NEARBY("is nearby and is notable for: ", false),
+		FRIENDS_CHAT("joined your friends chat and is notable for: ", true),
+		CLAN_CHAT("joined your clan and is notable for: ", true);
 
 		private final String message;
+		private final boolean isPriority;
 	}
 
 	/**
@@ -87,17 +102,23 @@ public class HiscoresWatchPlugin extends Plugin
 		 */
 		public String toDisplayString()
 		{
-			String base = "rank " + rank + " in " + hiscore.getName();
-			if (has200mXp)
+			// If the rank is notable (not -1), build the rank string.
+			if (rank != -1)
 			{
-				return base + " (200m XP)";
+				String base = "rank " + rank + " in " + hiscore.getName();
+				// If they also have 200m XP, append that.
+				if (has200mXp)
+				{
+					return base + " (200m XP)";
+				}
+				// Otherwise, just return the rank string.
+				return base;
 			}
-			// Handle the case where only 200m XP was notable, not the rank.
-			if (rank == -1)
+			else
 			{
+				// If the rank is -1, it means only the 200m XP was notable.
 				return "200m XP in " + hiscore.getName();
 			}
-			return base;
 		}
 	}
 
@@ -113,10 +134,6 @@ public class HiscoresWatchPlugin extends Plugin
 		private final DetectionSource source;
 	}
 
-	private static final String HISCORES_API_URL = "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=";
-	private static final long MAX_XP = 200_000_000L;
-	private static final int API_REQUEST_DELAY_MS = 500;
-
 	private Cache<String, Boolean> checkedPlayers;
 	private Set<String> ignoredPlayers;
 	// Keep track of current clan members to detect new joiners
@@ -124,7 +141,8 @@ public class HiscoresWatchPlugin extends Plugin
 
 	// --- API Throttling Components ---
 	private ScheduledExecutorService executor;
-	private final Queue<PlayerCheck> playerCheckQueue = new ConcurrentLinkedQueue<>();
+	// This is now a Deque to allow adding to the front (high-priority) or back (low-priority)
+	private final Deque<PlayerCheck> playerCheckQueue = new ConcurrentLinkedDeque<>();
 
 
 	@Inject
@@ -138,6 +156,9 @@ public class HiscoresWatchPlugin extends Plugin
 
 	@Inject
 	private OkHttpClient okHttpClient;
+
+	@Inject
+	private ConfigManager configManager;
 
 	@Inject
 	private HiscoresWatchConfig config;
@@ -194,9 +215,9 @@ public class HiscoresWatchPlugin extends Plugin
 	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
-		if (event.getGroup().equals("hiscoreswatch"))
+		if (event.getGroup().equals(CONFIG_GROUP))
 		{
-			if (event.getKey().equals("ignoreList"))
+			if (event.getKey().equals(IGNORE_LIST_KEY))
 			{
 				updateIgnoredPlayers();
 				log.debug("Hiscores Watch ignore list has been updated.");
@@ -206,10 +227,7 @@ public class HiscoresWatchPlugin extends Plugin
 
 	private void updateIgnoredPlayers()
 	{
-		this.ignoredPlayers = Arrays.stream(config.ignoreList().toLowerCase().split(","))
-				.map(String::trim)
-				.filter(name -> !name.isEmpty())
-				.collect(Collectors.toSet());
+		this.ignoredPlayers = getIgnoredPlayerListFromString(config.ignoreList());
 	}
 
 	@Subscribe
@@ -252,26 +270,55 @@ public class HiscoresWatchPlugin extends Plugin
 			return;
 		}
 
-		if (event.getClanChannel() == null)
+		ClanChannel clanChannel = event.getClanChannel();
+		if (clanChannel == null)
 		{
 			clanMembers.clear();
 			return;
 		}
 
-		event.getClanChannel().getMembers().forEach(newMember -> {
-			final String newMemberName = Text.toJagexName(newMember.getName());
-			if (!clanMembers.contains(newMemberName))
-			{
-				checkPlayer(newMemberName, DetectionSource.CLAN_CHAT);
-			}
-		});
+		// Get the current members from the event
+		Set<String> currentMembers = clanChannel.getMembers().stream()
+				.map(member -> Text.toJagexName(member.getName()))
+				.collect(Collectors.toSet());
 
+		// Use set operations to find who is new
+		Set<String> newMembers = new HashSet<>(currentMembers);
+		newMembers.removeAll(clanMembers);
+
+		// Check the new members
+		for (String newMemberName : newMembers)
+		{
+			checkPlayer(newMemberName, DetectionSource.CLAN_CHAT);
+		}
+
+		// Update the tracked list for the next event
 		clanMembers.clear();
-		event.getClanChannel().getMembers().forEach(member -> clanMembers.add(Text.toJagexName(member.getName())));
+		clanMembers.addAll(currentMembers);
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		// We only care about right-clicking on other players
+		int type = event.getType();
+		if (type >= MenuAction.PLAYER_FIRST_OPTION.getId() && type <= MenuAction.PLAYER_EIGHTH_OPTION.getId())
+		{
+			final String targetName = Text.toJagexName(event.getTarget());
+			final boolean isIgnored = ignoredPlayers.contains(targetName.toLowerCase());
+
+			// Add the "Ignore" or "Un-ignore" menu entry
+			client.createMenuEntry(-1)
+					.setOption(isIgnored ? "Un-ignore" : "Ignore")
+					.setTarget(ColorUtil.wrapWithColorTag(targetName, config.chatColor()))
+					.setType(MenuAction.RUNELITE)
+					.onClick(e -> togglePlayerIgnore(targetName, isIgnored));
+		}
 	}
 
 	/**
 	 * Adds a player to the lookup queue if they are not ignored or recently checked.
+	 * FC/CC members are prioritized by being added to the front of the queue.
 	 *
 	 * @param playerName The name of the player to check.
 	 * @param source     The source from which the player was detected.
@@ -297,7 +344,17 @@ public class HiscoresWatchPlugin extends Plugin
 		// Add to cache immediately to prevent duplicate queue entries
 		checkedPlayers.put(sanitizedName, true);
 
-		playerCheckQueue.add(new PlayerCheck(sanitizedName, source));
+		PlayerCheck playerCheck = new PlayerCheck(sanitizedName, source);
+
+		// Prioritize social notifications over nearby players by asking the source
+		if (source.isPriority())
+		{
+			playerCheckQueue.addFirst(playerCheck);
+		}
+		else
+		{
+			playerCheckQueue.addLast(playerCheck);
+		}
 	}
 
 	/**
@@ -384,9 +441,8 @@ public class HiscoresWatchPlugin extends Plugin
 								achievementMap.put(hiscore, new PlayerAchievement(hiscore, rank, false));
 							}
 
-							// 200M XP Check
-							boolean isSkill = hiscore.getApiIndex() <= Hiscores.CONSTRUCTION.getApiIndex();
-							if (alertFor200m && isSkill && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
+							// 200M XP Check - Using the robust isSkill() method from the enum
+							if (alertFor200m && hiscore.isSkill() && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
 							{
 								long xp = Long.parseLong(hiscoreStats[2]);
 								if (xp >= MAX_XP)
@@ -444,7 +500,6 @@ public class HiscoresWatchPlugin extends Plugin
 				.map(PlayerAchievement::toDisplayString)
 				.collect(Collectors.toList());
 
-		final int MAX_LISTED_ACHIEVEMENTS = 5;
 		int achievementCount = achievementStrings.size();
 
 		String logMessage = playerName + " " + source.getMessage() + String.join(", ", achievementStrings) + ".";
@@ -459,32 +514,68 @@ public class HiscoresWatchPlugin extends Plugin
 
 			if (achievementCount <= MAX_LISTED_ACHIEVEMENTS)
 			{
-				for (int i = 0; i < achievementCount; i++)
+				// Simplified message joining logic
+				if (achievementCount > 1)
 				{
-					chatMessageBuilder.append(alertColor, achievementStrings.get(i));
-					if (i < achievementCount - 2)
-					{
-						chatMessageBuilder.append(alertColor, ", ");
-					}
-					else if (i == achievementCount - 2)
-					{
-						chatMessageBuilder.append(alertColor, " and ");
-					}
+					String mostAchievements = String.join(", ", achievementStrings.subList(0, achievementCount - 1));
+					chatMessageBuilder.append(alertColor, mostAchievements)
+							.append(alertColor, " and ")
+							.append(alertColor, achievementStrings.get(achievementCount - 1));
+				}
+				else
+				{
+					chatMessageBuilder.append(alertColor, achievementStrings.get(0));
 				}
 			}
 			else
 			{
 				int moreCount = achievementCount - (MAX_LISTED_ACHIEVEMENTS - 1);
-				for (int i = 0; i < (MAX_LISTED_ACHIEVEMENTS - 1); i++)
-				{
-					chatMessageBuilder.append(alertColor, achievementStrings.get(i))
-							.append(alertColor, ", ");
-				}
-				chatMessageBuilder.append(alertColor, "... and " + moreCount + " more");
+				String listedAchievements = String.join(", ", achievementStrings.subList(0, MAX_LISTED_ACHIEVEMENTS - 1));
+				chatMessageBuilder.append(alertColor, listedAchievements)
+						.append(alertColor, ", ... and " + moreCount + " more");
 			}
 
 			chatMessageBuilder.append(alertColor, ".");
 			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessageBuilder.build(), null);
 		});
+	}
+
+	/**
+	 * A helper method to handle the logic for ignoring or un-ignoring a player.
+	 *
+	 * @param playerName The name of the player to toggle.
+	 * @param isIgnored  True if the player is currently on the ignore list.
+	 */
+	private void togglePlayerIgnore(String playerName, boolean isIgnored)
+	{
+		Set<String> ignoreSet = getIgnoredPlayerListFromString(config.ignoreList());
+
+		if (isIgnored)
+		{
+			ignoreSet.remove(playerName.toLowerCase());
+		}
+		else
+		{
+			ignoreSet.add(playerName.toLowerCase());
+		}
+
+		// Save the updated list back to the config, which will trigger onConfigChanged
+		String newIgnoreList = String.join(",", ignoreSet);
+		configManager.setConfiguration(CONFIG_GROUP, IGNORE_LIST_KEY, newIgnoreList);
+	}
+
+	/**
+	 * Parses the comma-separated config string into a modifiable set of player names.
+	 *
+	 * @param ignoreListString The string from the config.
+	 * @return A modifiable set of lower-case player names.
+	 */
+	private Set<String> getIgnoredPlayerListFromString(String ignoreListString)
+	{
+		return new HashSet<>(Arrays.asList(ignoreListString.toLowerCase().split(",")))
+				.stream()
+				.map(String::trim)
+				.filter(name -> !name.isEmpty())
+				.collect(Collectors.toSet());
 	}
 }
