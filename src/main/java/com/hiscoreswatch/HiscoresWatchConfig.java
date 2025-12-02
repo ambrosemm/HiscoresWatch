@@ -1,5 +1,6 @@
 package com.hiscoreswatch;
 
+import java.awt.Color;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
@@ -20,10 +21,9 @@ public interface HiscoresWatchConfig extends Config
 	)
 	default int rankThreshold()
 	{
-		return 25;
+		return 100;
 	}
 
-	// --- ADD THIS CONFIGURATION ITEM ---
 	@ConfigItem(
 			keyName = "alertFor200mXp",
 			name = "Alert for 200m XP",
@@ -32,6 +32,29 @@ public interface HiscoresWatchConfig extends Config
 	)
 	default boolean alertFor200mXp()
 	{
-		return true; // Enabled by default
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "ignoreList",
+			name = "Ignore List",
+			description = "Comma-separated list of player names to ignore. Not case-sensitive.",
+			position = 3
+	)
+	default String ignoreList()
+	{
+		return "";
+	}
+
+	// --- NEW CONFIGURATION ITEM ---
+	@ConfigItem(
+			keyName = "chatColor",
+			name = "Alert Color",
+			description = "The color of the chat message alert.",
+			position = 4
+	)
+	default Color chatColor()
+	{
+		return Color.RED; // The previous default color
 	}
 }

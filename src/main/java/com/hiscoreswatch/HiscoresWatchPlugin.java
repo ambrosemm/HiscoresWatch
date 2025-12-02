@@ -5,7 +5,15 @@ import com.google.common.cache.CacheBuilder;
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+// New Imports for the improved logic
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
@@ -18,7 +26,6 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-// JagexColors import is now removed as it's unused
 // This is the correct import path for the ChatMessageBuilder utility
 import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.util.Text;
@@ -34,12 +41,14 @@ import okhttp3.ResponseBody;
 @PluginDescriptor(
 		name = "Hiscores Watch"
 )
+
 public class HiscoresWatchPlugin extends Plugin
 {
 	private static final String HISCORES_API_URL = "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=";
-	// Use a long literal (L) for a long constant
 	private static final long MAX_XP = 200_000_000L;
+
 	private Cache<String, Boolean> checkedPlayers;
+	private Set<String> ignoredPlayers;
 
 	@Inject
 	private Client client;
@@ -68,7 +77,8 @@ public class HiscoresWatchPlugin extends Plugin
 		checkedPlayers = CacheBuilder.newBuilder()
 				.expireAfterWrite(5, TimeUnit.MINUTES)
 				.build();
-
+		// Initialize the ignore list on startup
+		updateIgnoredPlayers();
 		log.info("Hiscores Watch started!");
 		clientThread.invoke(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Hiscores Watch has started.", null));
 	}
@@ -83,6 +93,22 @@ public class HiscoresWatchPlugin extends Plugin
 			checkedPlayers.invalidateAll();
 			checkedPlayers = null;
 		}
+		if (ignoredPlayers != null)
+		{
+			ignoredPlayers.clear();
+			ignoredPlayers = null;
+		}
+	}
+
+	/**
+	 * Parses the comma-separated ignore list from the config into a Set for efficient lookups.
+	 */
+	private void updateIgnoredPlayers()
+	{
+		this.ignoredPlayers = Arrays.stream(config.ignoreList().toLowerCase().split(","))
+				.map(String::trim)
+				.filter(name -> !name.isEmpty())
+				.collect(Collectors.toSet());
 	}
 
 	@Subscribe
@@ -92,6 +118,13 @@ public class HiscoresWatchPlugin extends Plugin
 		String playerName = player.getName();
 
 		if (player == client.getLocalPlayer() || playerName == null)
+		{
+			return;
+		}
+
+		// --- IGNORE LIST LOGIC ---
+		// Check against the cached ignore list.
+		if (ignoredPlayers.contains(playerName.toLowerCase()))
 		{
 			return;
 		}
@@ -147,8 +180,12 @@ public class HiscoresWatchPlugin extends Plugin
 					final String body = responseBody.string();
 					final String[] stats = body.split("\n");
 					final int rankThreshold = config.rankThreshold();
-					// Use the new config setting instead of a hardcoded value
 					final boolean alertFor200m = config.alertFor200mXp();
+
+					// --- REFACTORED LOGIC ---
+					// Use a Map to store achievements, allowing us to combine them.
+					// LinkedHashMap preserves the insertion order.
+					final Map<Hiscores, String> achievementsMap = new LinkedHashMap<>();
 
 					for (Hiscores hiscore : Hiscores.values())
 					{
@@ -175,18 +212,27 @@ public class HiscoresWatchPlugin extends Plugin
 							// Rank Check
 							if (rank > 0 && score > 0 && rank <= rankThreshold)
 							{
-								sendRankAlert(playerName, rank, hiscore);
+								achievementsMap.put(hiscore, "rank " + rank + " in " + hiscore.getName());
 							}
 
-							// --- 200M XP CHECK (LOGIC UPDATED HERE) ---
+							// 200M XP Check
 							boolean isSkill = hiscore.getApiIndex() <= Hiscores.CONSTRUCTION.getApiIndex();
-							// Add a check to specifically exclude the "Overall" category
 							if (alertFor200m && isSkill && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
 							{
 								long xp = Long.parseLong(hiscoreStats[2]);
 								if (xp >= MAX_XP)
 								{
-									send200mXpAlert(playerName, hiscore);
+									if (achievementsMap.containsKey(hiscore))
+									{
+										// Player is high-ranked AND has 200m xp, append to the existing string.
+										String existing = achievementsMap.get(hiscore);
+										achievementsMap.put(hiscore, existing + " (200m XP)");
+									}
+									else
+									{
+										// Player only has 200m xp, not a notable rank.
+										achievementsMap.put(hiscore, "200m XP in " + hiscore.getName());
+									}
 								}
 							}
 						}
@@ -194,6 +240,13 @@ public class HiscoresWatchPlugin extends Plugin
 						{
 							log.warn("Failed to parse line for {} in category {}: {}", playerName, hiscore.getName(), e.getMessage());
 						}
+					}
+
+					// Process the collected achievements after the loop
+					if (!achievementsMap.isEmpty())
+					{
+						// Pass the values from the map to the alert method
+						sendCollapsedAlert(playerName, new ArrayList<>(achievementsMap.values()));
 					}
 				}
 				catch (Exception e)
@@ -204,40 +257,61 @@ public class HiscoresWatchPlugin extends Plugin
 		});
 	}
 
-	private void sendRankAlert(String playerName, int rank, Hiscores hiscore)
+	/**
+	 * Sends a single, consolidated alert for a player with one or more achievements.
+	 * @param playerName The name of the player.
+	 * @param achievements A list of their notable achievements.
+	 */
+	private void sendCollapsedAlert(String playerName, List<String> achievements)
 	{
+		// Define a limit for how many achievements to list before summarizing.
+		final int MAX_LISTED_ACHIEVEMENTS = 5;
+		int achievementCount = achievements.size();
+
+		// Build the simple string for logging
+		String logMessage = playerName + " is nearby and is notable for: " + String.join(", ", achievements) + ".";
+		log.info("High-ranking player found! {} with achievements: {}", playerName, logMessage);
+
 		clientThread.invoke(() -> {
-			String notificationMessage = String.format("%s is nearby and is rank %d in %s!",
-					playerName, rank, hiscore.getName());
-			notifier.notify(notificationMessage);
+			// --- COLOR IS NOW CONFIGURABLE ---
+			// Get the color from the config at the start of the method.
+			final Color alertColor = config.chatColor();
 
-			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder()
-					.append(Color.GREEN, playerName)
-					.append(Color.GREEN, " is nearby and is rank ")
-					.append(Color.GREEN, String.valueOf(rank))
-					.append(Color.GREEN, " in ")
-					.append(Color.GREEN, hiscore.getName())
-					.append(Color.GREEN, "!");
+			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder();
+			chatMessageBuilder.append(alertColor, playerName)
+					.append(alertColor, " is nearby and is notable for: ");
 
-			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessageBuilder.build(), null);
-		});
-	}
+			if (achievementCount <= MAX_LISTED_ACHIEVEMENTS)
+			{
+				// List all achievements with proper grammar
+				for (int i = 0; i < achievementCount; i++)
+				{
+					chatMessageBuilder.append(alertColor, achievements.get(i));
+					if (i < achievementCount - 2)
+					{
+						// Comma for items that are not the last two
+						chatMessageBuilder.append(alertColor, ", ");
+					}
+					else if (i == achievementCount - 2)
+					{
+						// " and " before the last item
+						chatMessageBuilder.append(alertColor, " and ");
+					}
+				}
+			}
+			else
+			{
+				// List the first few, then summarize the rest
+				int moreCount = achievementCount - (MAX_LISTED_ACHIEVEMENTS - 1);
+				for (int i = 0; i < (MAX_LISTED_ACHIEVEMENTS - 1); i++)
+				{
+					chatMessageBuilder.append(alertColor, achievements.get(i))
+							.append(alertColor, ", ");
+				}
+				chatMessageBuilder.append(alertColor, "... and " + moreCount + " more");
+			}
 
-	private void send200mXpAlert(String playerName, Hiscores hiscore)
-	{
-		clientThread.invoke(() -> {
-			String notificationMessage = String.format("%s is nearby with 200m XP in %s!",
-					playerName, hiscore.getName());
-			notifier.notify(notificationMessage);
-
-			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder()
-					.append(Color.GREEN, playerName)
-					.append(Color.GREEN, " is nearby with ")
-					.append(Color.GREEN, "200m XP")
-					.append(Color.GREEN, " in ")
-					.append(Color.GREEN, hiscore.getName())
-					.append(Color.GREEN, "!");
-
+			chatMessageBuilder.append(alertColor, ".");
 			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessageBuilder.build(), null);
 		});
 	}
