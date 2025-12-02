@@ -39,7 +39,9 @@ import okhttp3.ResponseBody;
 
 @Slf4j
 @PluginDescriptor(
-		name = "Hiscores Watch"
+		name = "HiscoresWatch",
+		description = "Notifies you when high-ranking players or players with 200m XP are nearby.",
+		tags = {"hiscores", "rank", "level", "xp", "player", "alert", "notification"}
 )
 
 public class HiscoresWatchPlugin extends Plugin
