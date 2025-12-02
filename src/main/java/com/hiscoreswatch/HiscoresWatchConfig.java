@@ -21,7 +21,7 @@ public interface HiscoresWatchConfig extends Config
 	)
 	default int rankThreshold()
 	{
-		return 100;
+		return 1000;
 	}
 
 	@ConfigItem(
@@ -46,7 +46,6 @@ public interface HiscoresWatchConfig extends Config
 		return "";
 	}
 
-	// --- NEW CONFIGURATION ITEM ---
 	@ConfigItem(
 			keyName = "chatColor",
 			name = "Alert Color",
@@ -55,6 +54,40 @@ public interface HiscoresWatchConfig extends Config
 	)
 	default Color chatColor()
 	{
-		return Color.RED; // The previous default color
+		return Color.RED;
+	}
+
+	// --- NEW CONFIGURATION ITEMS ---
+	@ConfigItem(
+			keyName = "checkNearbyPlayers",
+			name = "Check Nearby Players",
+			description = "Checks players who appear in your viewport.",
+			position = 5
+	)
+	default boolean checkNearbyPlayers()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "checkFriendsChat",
+			name = "Check Friends Chat",
+			description = "Checks players who join your friends chat channel.",
+			position = 6
+	)
+	default boolean checkFriendsChat()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "checkClanChat",
+			name = "Check Clan Chat",
+			description = "Checks players who join your clan chat.",
+			position = 7
+	)
+	default boolean checkClanChat()
+	{
+		return true;
 	}
 }

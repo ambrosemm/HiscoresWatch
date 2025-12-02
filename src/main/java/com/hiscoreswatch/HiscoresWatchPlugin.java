@@ -7,27 +7,38 @@ import java.awt.Color;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-// New Imports for the improved logic
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.Player;
+import net.runelite.api.events.ClanChannelChanged;
+import net.runelite.api.events.FriendsChatMemberJoined;
 import net.runelite.api.events.PlayerSpawned;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-// This is the correct import path for the ChatMessageBuilder utility
-import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.util.Text;
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -41,16 +52,80 @@ import okhttp3.ResponseBody;
 @PluginDescriptor(
 		name = "HiscoresWatch",
 		description = "Notifies you when high-ranking players or players with 200m XP are nearby.",
-		tags = {"hiscores", "rank", "level", "xp", "player", "alert", "notification"}
+		tags = {"hiscores", "rank", "level", "xp", "player", "alert", "notification", "clan", "friends chat"}
 )
-
 public class HiscoresWatchPlugin extends Plugin
 {
+	/**
+	 * An enum representing the source of a player detection event.
+	 */
+	@Getter
+	@RequiredArgsConstructor
+	private enum DetectionSource
+	{
+		NEARBY("is nearby and is notable for: "),
+		FRIENDS_CHAT("joined your friends chat and is notable for: "),
+		CLAN_CHAT("joined your clan and is notable for: ");
+
+		private final String message;
+	}
+
+	/**
+	 * A class to hold structured data about a player's achievement for sorting.
+	 */
+	@Getter
+	@Setter
+	@AllArgsConstructor
+	private static class PlayerAchievement
+	{
+		private Hiscores hiscore;
+		private int rank;
+		private boolean has200mXp;
+
+		/**
+		 * Converts the achievement object into its final display string.
+		 */
+		public String toDisplayString()
+		{
+			String base = "rank " + rank + " in " + hiscore.getName();
+			if (has200mXp)
+			{
+				return base + " (200m XP)";
+			}
+			// Handle the case where only 200m XP was notable, not the rank.
+			if (rank == -1)
+			{
+				return "200m XP in " + hiscore.getName();
+			}
+			return base;
+		}
+	}
+
+	/**
+	 * A class to hold a player check request for the processing queue.
+	 * This replaces the Java 16+ 'record' for Java 11 compatibility.
+	 */
+	@RequiredArgsConstructor
+	@Getter
+	private static final class PlayerCheck
+	{
+		private final String playerName;
+		private final DetectionSource source;
+	}
+
 	private static final String HISCORES_API_URL = "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=";
 	private static final long MAX_XP = 200_000_000L;
+	private static final int API_REQUEST_DELAY_MS = 500;
 
 	private Cache<String, Boolean> checkedPlayers;
 	private Set<String> ignoredPlayers;
+	// Keep track of current clan members to detect new joiners
+	private final Set<String> clanMembers = new HashSet<>();
+
+	// --- API Throttling Components ---
+	private ScheduledExecutorService executor;
+	private final Queue<PlayerCheck> playerCheckQueue = new ConcurrentLinkedQueue<>();
+
 
 	@Inject
 	private Client client;
@@ -81,6 +156,11 @@ public class HiscoresWatchPlugin extends Plugin
 				.build();
 		// Initialize the ignore list on startup
 		updateIgnoredPlayers();
+
+		// --- Start the API Throttling Worker ---
+		executor = Executors.newSingleThreadScheduledExecutor();
+		executor.scheduleAtFixedRate(this::processQueue, 2000, API_REQUEST_DELAY_MS, TimeUnit.MILLISECONDS);
+
 		log.info("Hiscores Watch started!");
 		clientThread.invoke(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Hiscores Watch has started.", null));
 	}
@@ -88,6 +168,14 @@ public class HiscoresWatchPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		// --- Stop the API Throttling Worker ---
+		if (executor != null)
+		{
+			executor.shutdown();
+			executor = null;
+		}
+		playerCheckQueue.clear();
+
 		log.info("Hiscores Watch stopped!");
 		clientThread.invoke(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Hiscores Watch has stopped.", null));
 		if (checkedPlayers != null)
@@ -100,11 +188,22 @@ public class HiscoresWatchPlugin extends Plugin
 			ignoredPlayers.clear();
 			ignoredPlayers = null;
 		}
+		clanMembers.clear();
 	}
 
-	/**
-	 * Parses the comma-separated ignore list from the config into a Set for efficient lookups.
-	 */
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals("hiscoreswatch"))
+		{
+			if (event.getKey().equals("ignoreList"))
+			{
+				updateIgnoredPlayers();
+				log.debug("Hiscores Watch ignore list has been updated.");
+			}
+		}
+	}
+
 	private void updateIgnoredPlayers()
 	{
 		this.ignoredPlayers = Arrays.stream(config.ignoreList().toLowerCase().split(","))
@@ -116,33 +215,104 @@ public class HiscoresWatchPlugin extends Plugin
 	@Subscribe
 	public void onPlayerSpawned(PlayerSpawned event)
 	{
-		Player player = event.getPlayer();
-		String playerName = player.getName();
-
-		if (player == client.getLocalPlayer() || playerName == null)
+		if (!config.checkNearbyPlayers())
 		{
 			return;
 		}
 
-		// --- IGNORE LIST LOGIC ---
-		// Check against the cached ignore list.
-		if (ignoredPlayers.contains(playerName.toLowerCase()))
+		Player player = event.getPlayer();
+		if (player == client.getLocalPlayer())
+		{
+			return;
+		}
+		checkPlayer(player.getName(), DetectionSource.NEARBY);
+	}
+
+	@Subscribe
+	public void onFriendsChatMemberJoined(FriendsChatMemberJoined event)
+	{
+		if (!config.checkFriendsChat())
+		{
+			return;
+		}
+
+		String playerName = event.getMember().getName();
+		if (client.getLocalPlayer() != null && playerName.equals(client.getLocalPlayer().getName()))
+		{
+			return;
+		}
+		checkPlayer(playerName, DetectionSource.FRIENDS_CHAT);
+	}
+
+	@Subscribe
+	public void onClanChannelChanged(ClanChannelChanged event)
+	{
+		if (!config.checkClanChat())
+		{
+			return;
+		}
+
+		if (event.getClanChannel() == null)
+		{
+			clanMembers.clear();
+			return;
+		}
+
+		event.getClanChannel().getMembers().forEach(newMember -> {
+			final String newMemberName = Text.toJagexName(newMember.getName());
+			if (!clanMembers.contains(newMemberName))
+			{
+				checkPlayer(newMemberName, DetectionSource.CLAN_CHAT);
+			}
+		});
+
+		clanMembers.clear();
+		event.getClanChannel().getMembers().forEach(member -> clanMembers.add(Text.toJagexName(member.getName())));
+	}
+
+	/**
+	 * Adds a player to the lookup queue if they are not ignored or recently checked.
+	 *
+	 * @param playerName The name of the player to check.
+	 * @param source     The source from which the player was detected.
+	 */
+	private void checkPlayer(String playerName, DetectionSource source)
+	{
+		if (playerName == null)
 		{
 			return;
 		}
 
 		String sanitizedName = Text.toJagexName(playerName);
-
-		if (checkedPlayers.getIfPresent(sanitizedName) != null)
+		if (ignoredPlayers.contains(sanitizedName.toLowerCase()))
 		{
 			return;
 		}
 
+		// Check if we've already processed this player recently
+		if (checkedPlayers.getIfPresent(sanitizedName) != null)
+		{
+			return;
+		}
+		// Add to cache immediately to prevent duplicate queue entries
 		checkedPlayers.put(sanitizedName, true);
-		fetchHiscores(sanitizedName);
+
+		playerCheckQueue.add(new PlayerCheck(sanitizedName, source));
 	}
 
-	private void fetchHiscores(String playerName)
+	/**
+	 * Processes one player from the queue, called by the scheduled executor.
+	 */
+	private void processQueue()
+	{
+		PlayerCheck playerCheck = playerCheckQueue.poll();
+		if (playerCheck != null)
+		{
+			fetchHiscores(playerCheck.getPlayerName(), playerCheck.getSource());
+		}
+	}
+
+	private void fetchHiscores(String playerName, DetectionSource source)
 	{
 		log.debug("Attempting to fetch hiscores for: {}", playerName);
 
@@ -184,15 +354,12 @@ public class HiscoresWatchPlugin extends Plugin
 					final int rankThreshold = config.rankThreshold();
 					final boolean alertFor200m = config.alertFor200mXp();
 
-					// --- REFACTORED LOGIC ---
-					// Use a Map to store achievements, allowing us to combine them.
-					// LinkedHashMap preserves the insertion order.
-					final Map<Hiscores, String> achievementsMap = new LinkedHashMap<>();
+					// Use a map to easily combine rank and 200m XP for the same skill
+					final Map<Hiscores, PlayerAchievement> achievementMap = new LinkedHashMap<>();
 
 					for (Hiscores hiscore : Hiscores.values())
 					{
 						int apiIndex = hiscore.getApiIndex();
-
 						if (stats.length <= apiIndex)
 						{
 							log.warn("Hiscores response for {} was too short. Stopping check at {}.", playerName, hiscore.getName());
@@ -214,7 +381,7 @@ public class HiscoresWatchPlugin extends Plugin
 							// Rank Check
 							if (rank > 0 && score > 0 && rank <= rankThreshold)
 							{
-								achievementsMap.put(hiscore, "rank " + rank + " in " + hiscore.getName());
+								achievementMap.put(hiscore, new PlayerAchievement(hiscore, rank, false));
 							}
 
 							// 200M XP Check
@@ -224,16 +391,16 @@ public class HiscoresWatchPlugin extends Plugin
 								long xp = Long.parseLong(hiscoreStats[2]);
 								if (xp >= MAX_XP)
 								{
-									if (achievementsMap.containsKey(hiscore))
+									PlayerAchievement existing = achievementMap.get(hiscore);
+									if (existing != null)
 									{
-										// Player is high-ranked AND has 200m xp, append to the existing string.
-										String existing = achievementsMap.get(hiscore);
-										achievementsMap.put(hiscore, existing + " (200m XP)");
+										existing.setHas200mXp(true);
 									}
 									else
 									{
 										// Player only has 200m xp, not a notable rank.
-										achievementsMap.put(hiscore, "200m XP in " + hiscore.getName());
+										// Use -1 rank to signify this special case.
+										achievementMap.put(hiscore, new PlayerAchievement(hiscore, -1, true));
 									}
 								}
 							}
@@ -244,11 +411,22 @@ public class HiscoresWatchPlugin extends Plugin
 						}
 					}
 
-					// Process the collected achievements after the loop
-					if (!achievementsMap.isEmpty())
+					if (!achievementMap.isEmpty())
 					{
-						// Pass the values from the map to the alert method
-						sendCollapsedAlert(playerName, new ArrayList<>(achievementsMap.values()));
+						// Convert map values to a list for sorting
+						List<PlayerAchievement> achievements = new ArrayList<>(achievementMap.values());
+
+						// --- ENHANCED SORTING LOGIC ---
+						achievements.sort(Comparator
+								// 1. Prioritize "Overall" rank above all else.
+								.comparing((PlayerAchievement a) -> a.getHiscore() != Hiscores.OVERALL)
+								// 2. Prioritize achievements with a valid rank over 200m-only ones.
+								.thenComparing((PlayerAchievement a) -> a.getRank() == -1)
+								// 3. Finally, sort by rank number ascending (lower is better).
+								.thenComparingInt(PlayerAchievement::getRank)
+						);
+
+						sendCollapsedAlert(playerName, achievements, source);
 					}
 				}
 				catch (Exception e)
@@ -259,55 +437,47 @@ public class HiscoresWatchPlugin extends Plugin
 		});
 	}
 
-	/**
-	 * Sends a single, consolidated alert for a player with one or more achievements.
-	 * @param playerName The name of the player.
-	 * @param achievements A list of their notable achievements.
-	 */
-	private void sendCollapsedAlert(String playerName, List<String> achievements)
+	private void sendCollapsedAlert(String playerName, List<PlayerAchievement> achievements, DetectionSource source)
 	{
-		// Define a limit for how many achievements to list before summarizing.
-		final int MAX_LISTED_ACHIEVEMENTS = 5;
-		int achievementCount = achievements.size();
+		// Convert the sorted list of objects to a list of display strings
+		List<String> achievementStrings = achievements.stream()
+				.map(PlayerAchievement::toDisplayString)
+				.collect(Collectors.toList());
 
-		// Build the simple string for logging
-		String logMessage = playerName + " is nearby and is notable for: " + String.join(", ", achievements) + ".";
-		log.info("High-ranking player found! {} with achievements: {}", playerName, logMessage);
+		final int MAX_LISTED_ACHIEVEMENTS = 5;
+		int achievementCount = achievementStrings.size();
+
+		String logMessage = playerName + " " + source.getMessage() + String.join(", ", achievementStrings) + ".";
+		log.info("High-ranking player found! {}", logMessage);
 
 		clientThread.invoke(() -> {
-			// --- COLOR IS NOW CONFIGURABLE ---
-			// Get the color from the config at the start of the method.
 			final Color alertColor = config.chatColor();
 
 			ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder();
 			chatMessageBuilder.append(alertColor, playerName)
-					.append(alertColor, " is nearby and is notable for: ");
+					.append(alertColor, " " + source.getMessage());
 
 			if (achievementCount <= MAX_LISTED_ACHIEVEMENTS)
 			{
-				// List all achievements with proper grammar
 				for (int i = 0; i < achievementCount; i++)
 				{
-					chatMessageBuilder.append(alertColor, achievements.get(i));
+					chatMessageBuilder.append(alertColor, achievementStrings.get(i));
 					if (i < achievementCount - 2)
 					{
-						// Comma for items that are not the last two
 						chatMessageBuilder.append(alertColor, ", ");
 					}
 					else if (i == achievementCount - 2)
 					{
-						// " and " before the last item
 						chatMessageBuilder.append(alertColor, " and ");
 					}
 				}
 			}
 			else
 			{
-				// List the first few, then summarize the rest
 				int moreCount = achievementCount - (MAX_LISTED_ACHIEVEMENTS - 1);
 				for (int i = 0; i < (MAX_LISTED_ACHIEVEMENTS - 1); i++)
 				{
-					chatMessageBuilder.append(alertColor, achievements.get(i))
+					chatMessageBuilder.append(alertColor, achievementStrings.get(i))
 							.append(alertColor, ", ");
 				}
 				chatMessageBuilder.append(alertColor, "... and " + moreCount + " more");

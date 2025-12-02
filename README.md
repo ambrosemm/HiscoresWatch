@@ -13,7 +13,7 @@ This plugin notifies you in chat when a high-ranking player or a player with 200
 
 The plugin offers several options to tailor the alerts to your liking:
 
-*   **Rank Threshold:** (Default: 100) Sets the rank at or below which a player will trigger an alert.
+*   **Rank Threshold:** (Default: 1000) Sets the rank at or below which a player will trigger an alert.
 *   **Alert for 200m XP:** (Default: On) Toggles whether to alert for players with 200m XP in a skill.
 *   **Ignore List:** A comma-separated list of player names to ignore.
 *   **Alert Color:** (Default: Red) Opens a color picker to set the color of the chat message alert.
