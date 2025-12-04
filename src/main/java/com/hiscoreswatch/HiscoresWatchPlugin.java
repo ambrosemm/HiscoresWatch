@@ -67,7 +67,7 @@ public class HiscoresWatchPlugin extends Plugin
 	private static final int MAX_LISTED_ACHIEVEMENTS = 5;
 
 	// Constants for configuration management
-	private static final String CONFIG_GROUP = "hiscoreswatch";
+	public static final String CONFIG_GROUP = "hiscoreswatch";
 	private static final String IGNORE_LIST_KEY = "ignoreList";
 
 	/**
@@ -136,13 +136,11 @@ public class HiscoresWatchPlugin extends Plugin
 
 	private Cache<String, Boolean> checkedPlayers;
 	private Set<String> ignoredPlayers;
-	// Keep track of current clan members to detect new joiners
-	private final Set<String> clanMembers = new HashSet<>();
+	private Set<String> clanMembers;
+	private Deque<PlayerCheck> playerCheckQueue;
 
 	// --- API Throttling Components ---
 	private ScheduledExecutorService executor;
-	// This is now a Deque to allow adding to the front (high-priority) or back (low-priority)
-	private final Deque<PlayerCheck> playerCheckQueue = new ConcurrentLinkedDeque<>();
 
 
 	@Inject
@@ -172,6 +170,10 @@ public class HiscoresWatchPlugin extends Plugin
 	@Override
 	protected void startUp() throws Exception
 	{
+		// Initialize collections here to align with the plugin lifecycle
+		clanMembers = new HashSet<>();
+		playerCheckQueue = new ConcurrentLinkedDeque<>();
+
 		checkedPlayers = CacheBuilder.newBuilder()
 				.expireAfterWrite(5, TimeUnit.MINUTES)
 				.build();
@@ -196,6 +198,7 @@ public class HiscoresWatchPlugin extends Plugin
 			executor = null;
 		}
 		playerCheckQueue.clear();
+		clanMembers.clear();
 
 		log.info("Hiscores Watch stopped!");
 		clientThread.invoke(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Hiscores Watch has stopped.", null));
@@ -209,7 +212,6 @@ public class HiscoresWatchPlugin extends Plugin
 			ignoredPlayers.clear();
 			ignoredPlayers = null;
 		}
-		clanMembers.clear();
 	}
 
 	@Subscribe
@@ -391,106 +393,104 @@ public class HiscoresWatchPlugin extends Plugin
 			}
 
 			@Override
-			public void onResponse(Call call, Response response)
+			public void onResponse(Call call, Response response) throws IOException
 			{
+				if (!response.isSuccessful())
+				{
+					log.debug("Unsuccessful hiscores response for {}. Code: {}", playerName, response.code());
+					return;
+				}
+
 				try (ResponseBody responseBody = response.body())
 				{
-					if (!response.isSuccessful())
+					if (responseBody != null)
 					{
-						log.debug("Unsuccessful hiscores response for {}. Code: {}", playerName, response.code());
-						return;
+						// Delegate the core logic to a dedicated method
+						processHiscoresData(playerName, responseBody.string(), source);
 					}
-
-					if (responseBody == null)
-					{
-						return;
-					}
-
-					final String body = responseBody.string();
-					final String[] stats = body.split("\n");
-					final int rankThreshold = config.rankThreshold();
-					final boolean alertFor200m = config.alertFor200mXp();
-
-					// Use a map to easily combine rank and 200m XP for the same skill
-					final Map<Hiscores, PlayerAchievement> achievementMap = new LinkedHashMap<>();
-
-					for (Hiscores hiscore : Hiscores.values())
-					{
-						int apiIndex = hiscore.getApiIndex();
-						if (stats.length <= apiIndex)
-						{
-							log.warn("Hiscores response for {} was too short. Stopping check at {}.", playerName, hiscore.getName());
-							break;
-						}
-
-						String hiscoreData = stats[apiIndex];
-						if (hiscoreData.isEmpty() || !hiscoreData.contains(","))
-						{
-							continue;
-						}
-
-						try
-						{
-							String[] hiscoreStats = hiscoreData.split(",");
-							int rank = Integer.parseInt(hiscoreStats[0]);
-							int score = Integer.parseInt(hiscoreStats[1]);
-
-							// Rank Check
-							if (rank > 0 && score > 0 && rank <= rankThreshold)
-							{
-								achievementMap.put(hiscore, new PlayerAchievement(hiscore, rank, false));
-							}
-
-							// 200M XP Check - Using the robust isSkill() method from the enum
-							if (alertFor200m && hiscore.isSkill() && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
-							{
-								long xp = Long.parseLong(hiscoreStats[2]);
-								if (xp >= MAX_XP)
-								{
-									PlayerAchievement existing = achievementMap.get(hiscore);
-									if (existing != null)
-									{
-										existing.setHas200mXp(true);
-									}
-									else
-									{
-										// Player only has 200m xp, not a notable rank.
-										// Use -1 rank to signify this special case.
-										achievementMap.put(hiscore, new PlayerAchievement(hiscore, -1, true));
-									}
-								}
-							}
-						}
-						catch (NumberFormatException | ArrayIndexOutOfBoundsException e)
-						{
-							log.warn("Failed to parse line for {} in category {}: {}", playerName, hiscore.getName(), e.getMessage());
-						}
-					}
-
-					if (!achievementMap.isEmpty())
-					{
-						// Convert map values to a list for sorting
-						List<PlayerAchievement> achievements = new ArrayList<>(achievementMap.values());
-
-						// --- ENHANCED SORTING LOGIC ---
-						achievements.sort(Comparator
-								// 1. Prioritize "Overall" rank above all else.
-								.comparing((PlayerAchievement a) -> a.getHiscore() != Hiscores.OVERALL)
-								// 2. Prioritize achievements with a valid rank over 200m-only ones.
-								.thenComparing((PlayerAchievement a) -> a.getRank() == -1)
-								// 3. Finally, sort by rank number ascending (lower is better).
-								.thenComparingInt(PlayerAchievement::getRank)
-						);
-
-						sendCollapsedAlert(playerName, achievements, source);
-					}
-				}
-				catch (Exception e)
-				{
-					log.error("Failed to process hiscores response for player {}: {}", playerName, e.getMessage());
 				}
 			}
 		});
+	}
+
+	/**
+	 * Parses the raw hiscores string and triggers an alert if notable achievements are found.
+	 *
+	 * @param playerName The name of the player.
+	 * @param hiscoresData The raw string data from the hiscores API.
+	 * @param source The source of the player detection.
+	 */
+	private void processHiscoresData(String playerName, String hiscoresData, DetectionSource source)
+	{
+		try
+		{
+			final String[] stats = hiscoresData.split("\n");
+			final int rankThreshold = config.rankThreshold();
+			final boolean alertFor200m = config.alertFor200mXp();
+
+			final Map<Hiscores, PlayerAchievement> achievementMap = new LinkedHashMap<>();
+
+			for (Hiscores hiscore : Hiscores.values())
+			{
+				int apiIndex = hiscore.getApiIndex();
+				if (stats.length <= apiIndex)
+				{
+					log.warn("Hiscores response for {} was too short. Stopping check at {}.", playerName, hiscore.getName());
+					break;
+				}
+
+				String hiscoreLine = stats[apiIndex];
+				if (hiscoreLine.isEmpty() || !hiscoreLine.contains(","))
+				{
+					continue;
+				}
+
+				try
+				{
+					String[] hiscoreStats = hiscoreLine.split(",");
+					int rank = Integer.parseInt(hiscoreStats[0]);
+					int score = Integer.parseInt(hiscoreStats[1]);
+
+					// Rank Check
+					if (rank > 0 && score > 0 && rank <= rankThreshold)
+					{
+						achievementMap.computeIfAbsent(hiscore, h -> new PlayerAchievement(h, rank, false));
+					}
+
+					// 200M XP Check
+					if (alertFor200m && hiscore.isSkill() && hiscore != Hiscores.OVERALL && hiscoreStats.length > 2)
+					{
+						long xp = Long.parseLong(hiscoreStats[2]);
+						if (xp >= MAX_XP)
+						{
+							PlayerAchievement achievement = achievementMap.computeIfAbsent(hiscore, h -> new PlayerAchievement(h, -1, false));
+							achievement.setHas200mXp(true);
+						}
+					}
+				}
+				catch (NumberFormatException | ArrayIndexOutOfBoundsException e)
+				{
+					log.warn("Failed to parse line for {} in category {}: {}", playerName, hiscore.getName(), e.getMessage());
+				}
+			}
+
+			if (!achievementMap.isEmpty())
+			{
+				List<PlayerAchievement> achievements = new ArrayList<>(achievementMap.values());
+
+				achievements.sort(Comparator
+						.comparing((PlayerAchievement a) -> a.getHiscore() != Hiscores.OVERALL)
+						.thenComparing((PlayerAchievement a) -> a.getRank() == -1 && !a.isHas200mXp())
+						.thenComparingInt(PlayerAchievement::getRank)
+				);
+
+				sendCollapsedAlert(playerName, achievements, source);
+			}
+		}
+		catch (Exception e)
+		{
+			log.error("Failed to process hiscores response for player {}: {}", playerName, e.getMessage(), e);
+		}
 	}
 
 	private void sendCollapsedAlert(String playerName, List<PlayerAchievement> achievements, DetectionSource source)
